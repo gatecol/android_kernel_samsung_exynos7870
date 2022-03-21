@@ -24,6 +24,8 @@
 #include <linux/hid.h>
 #include <asm/unaligned.h>
 
+#include "../u_f.h"
+
 #include <linux/usb/composite.h>
 #include <linux/usb/functionfs.h>
 
@@ -33,7 +35,6 @@
 #include <linux/eventfd.h>
 
 #define FUNCTIONFS_MAGIC	0xa647361 /* Chosen by a honest dice roll ;) */
-
 
 /* Debugging ****************************************************************/
 
@@ -108,7 +109,7 @@ enum ffs_setup_state {
 	 * setup.  If this state is set read/write on ep0 return
 	 * -EIDRM.  This state is only set when adding event.
 	 */
-	FFS_SETUP_CANCELED
+	FFS_SETUP_CANCELLED
 };
 
 
@@ -155,18 +156,17 @@ struct ffs_data {
 
 	/*
 	 * Possible transitions:
-	 * + FFS_NO_SETUP       -> FFS_SETUP_PENDING  -- P: ev.waitq.lock
+	 * + FFS_NO_SETUP        -> FFS_SETUP_PENDING   -- P: ev.waitq.lock
 	 *               happens only in ep0 read which is P: mutex
-	 * + FFS_SETUP_PENDING  -> FFS_NO_SETUP       -- P: ev.waitq.lock
+	 * + FFS_SETUP_PENDING   -> FFS_NO_SETUP        -- P: ev.waitq.lock
 	 *               happens only in ep0 i/o  which is P: mutex
-	 * + FFS_SETUP_PENDING  -> FFS_SETUP_CANCELED -- P: ev.waitq.lock
-	 * + FFS_SETUP_CANCELED -> FFS_NO_SETUP       -- cmpxchg
+	 * + FFS_SETUP_PENDING   -> FFS_SETUP_CANCELLED -- P: ev.waitq.lock
+	 * + FFS_SETUP_CANCELLED -> FFS_NO_SETUP        -- cmpxchg
+	 *
+	 * This field should never be accessed directly and instead
+	 * ffs_setup_state_clear_cancelled function should be used.
 	 */
 	enum ffs_setup_state		setup_state;
-
-#define FFS_SETUP_STATE(ffs)					\
-	((enum ffs_setup_state)cmpxchg(&(ffs)->setup_state,	\
-				       FFS_SETUP_CANCELED, FFS_NO_SETUP))
 
 	/* Events & such. */
 	struct {
@@ -279,6 +279,14 @@ static struct ffs_function *ffs_func_from_usb(struct usb_function *f)
 }
 
 static void ffs_func_free(struct ffs_function *func);
+
+static inline enum ffs_setup_state
+ffs_setup_state_clear_cancelled(struct ffs_data *ffs)
+{
+	return (enum ffs_setup_state)
+		cmpxchg(&ffs->setup_state, FFS_SETUP_CANCELLED, FFS_NO_SETUP);
+}
+
 
 static void ffs_func_eps_disable(struct ffs_function *func);
 static int __must_check ffs_func_eps_enable(struct ffs_function *func);
@@ -443,7 +451,7 @@ static ssize_t ffs_ep0_write(struct file *file, const char __user *buf,
 	ENTER();
 
 	/* Fast check if setup was canceled */
-	if (FFS_SETUP_STATE(ffs) == FFS_SETUP_CANCELED)
+	if (ffs_setup_state_clear_cancelled(ffs) == FFS_SETUP_CANCELLED)
 		return -EIDRM;
 
 	/* Acquire mutex */
@@ -502,8 +510,8 @@ static ssize_t ffs_ep0_write(struct file *file, const char __user *buf,
 		 * rather then _irqsave
 		 */
 		spin_lock_irq(&ffs->ev.waitq.lock);
-		switch (FFS_SETUP_STATE(ffs)) {
-		case FFS_SETUP_CANCELED:
+		switch (ffs_setup_state_clear_cancelled(ffs)) {
+		case FFS_SETUP_CANCELLED:
 			ret = -EIDRM;
 			goto done_spin;
 
@@ -538,7 +546,7 @@ static ssize_t ffs_ep0_write(struct file *file, const char __user *buf,
 		/*
 		 * We are guaranteed to be still in FFS_ACTIVE state
 		 * but the state of setup could have changed from
-		 * FFS_SETUP_PENDING to FFS_SETUP_CANCELED so we need
+		 * FFS_SETUP_PENDING to FFS_SETUP_CANCELLED so we need
 		 * to check for that.  If that happened we copied data
 		 * from user space in vain but it's unlikely.
 		 *
@@ -547,7 +555,8 @@ static ssize_t ffs_ep0_write(struct file *file, const char __user *buf,
 		 * transition can be performed and it's protected by
 		 * mutex.
 		 */
-		if (FFS_SETUP_STATE(ffs) == FFS_SETUP_CANCELED) {
+		if (ffs_setup_state_clear_cancelled(ffs) ==
+		    FFS_SETUP_CANCELLED) {
 			ret = -EIDRM;
 done_spin:
 			spin_unlock_irq(&ffs->ev.waitq.lock);
@@ -613,7 +622,7 @@ static ssize_t ffs_ep0_read(struct file *file, char __user *buf,
 	ENTER();
 
 	/* Fast check if setup was canceled */
-	if (FFS_SETUP_STATE(ffs) == FFS_SETUP_CANCELED)
+	if (ffs_setup_state_clear_cancelled(ffs) == FFS_SETUP_CANCELLED)
 		return -EIDRM;
 
 	/* Acquire mutex */
@@ -633,8 +642,8 @@ static ssize_t ffs_ep0_read(struct file *file, char __user *buf,
 	 */
 	spin_lock_irq(&ffs->ev.waitq.lock);
 
-	switch (FFS_SETUP_STATE(ffs)) {
-	case FFS_SETUP_CANCELED:
+	switch (ffs_setup_state_clear_cancelled(ffs)) {
+	case FFS_SETUP_CANCELLED:
 		ret = -EIDRM;
 		break;
 
@@ -681,7 +690,8 @@ static ssize_t ffs_ep0_read(struct file *file, char __user *buf,
 		spin_lock_irq(&ffs->ev.waitq.lock);
 
 		/* See ffs_ep0_write() */
-		if (FFS_SETUP_STATE(ffs) == FFS_SETUP_CANCELED) {
+		if (ffs_setup_state_clear_cancelled(ffs) ==
+		    FFS_SETUP_CANCELLED) {
 			ret = -EIDRM;
 			break;
 		}
@@ -1598,7 +1608,7 @@ static struct ffs_data *ffs_data_new(void)
 {
 	struct ffs_data *ffs = kzalloc(sizeof *ffs, GFP_KERNEL);
 	if (unlikely(!ffs))
-		return 0;
+		return NULL;
 
 	ENTER();
 
@@ -2252,30 +2262,34 @@ static int __ffs_data_got_strings(struct ffs_data *ffs,
 
 	/* Allocate everything in one chunk so there's less maintenance. */
 	{
-		struct {
-			struct usb_gadget_strings *stringtabs[lang_count + 1];
-			struct usb_gadget_strings stringtab[lang_count];
-			struct usb_string strings[lang_count*(needed_count+1)];
-		} *d;
 		unsigned i = 0;
+		vla_group(d);
+		vla_item(d, struct usb_gadget_strings *, stringtabs,
+			lang_count + 1);
+		vla_item(d, struct usb_gadget_strings, stringtab, lang_count);
+		vla_item(d, struct usb_string, strings,
+			lang_count*(needed_count+1));
 
-		d = kmalloc(sizeof *d, GFP_KERNEL);
-		if (unlikely(!d)) {
+		char *vlabuf = kmalloc(vla_group_size(d), GFP_KERNEL);
+
+		if (unlikely(!vlabuf)) {
 			kfree(_data);
 			return -ENOMEM;
 		}
 
-		stringtabs = d->stringtabs;
-		t = d->stringtab;
+		/* Initialize the VLA pointers */
+		stringtabs = vla_ptr(vlabuf, d, stringtabs);
+		t = vla_ptr(vlabuf, d, stringtab);
 		i = lang_count;
 		do {
 			*stringtabs++ = t++;
 		} while (--i);
 		*stringtabs = NULL;
 
-		stringtabs = d->stringtabs;
-		t = d->stringtab;
-		s = d->strings;
+		/* stringtabs = vlabuf = d_stringtabs for later kfree */
+		stringtabs = vla_ptr(vlabuf, d, stringtabs);
+		t = vla_ptr(vlabuf, d, stringtab);
+		s = vla_ptr(vlabuf, d, strings);
 		strings = s;
 	}
 
@@ -2363,7 +2377,7 @@ static void __ffs_event_add(struct ffs_data *ffs,
 	 * the source does nothing.
 	 */
 	if (ffs->setup_state == FFS_SETUP_PENDING)
-		ffs->setup_state = FFS_SETUP_CANCELED;
+		ffs->setup_state = FFS_SETUP_CANCELLED;
 
 	switch (type) {
 	case FUNCTIONFS_RESUME:
@@ -2560,17 +2574,17 @@ static int ffs_func_bind(struct usb_configuration *c,
 	int fs_len, hs_len, ret;
 
 	/* Make it a single chunk, less management later on */
-	struct {
-		struct ffs_ep eps[ffs->eps_count];
-		struct usb_descriptor_header
-			*fs_descs[full ? ffs->fs_descs_count + 1 : 0];
-		struct usb_descriptor_header
-			*hs_descs[high ? ffs->hs_descs_count + 1 : 0];
-		struct usb_descriptor_header
-			*ss_descs[super ? ffs->ss_descs_count + 1 : 0];
-		short inums[ffs->interfaces_count];
-		char raw_descs[ffs->raw_descs_length];
-	} *data;
+	vla_group(d);
+	vla_item_with_sz(d, struct ffs_ep, eps, ffs->eps_count);
+	vla_item_with_sz(d, struct usb_descriptor_header *, fs_descs,
+		full ? ffs->fs_descs_count + 1 : 0);
+	vla_item_with_sz(d, struct usb_descriptor_header *, hs_descs,
+		high ? ffs->hs_descs_count + 1 : 0);
+	vla_item_with_sz(d, struct usb_descriptor_header *, ss_descs,
+		super ? ffs->ss_descs_count + 1 : 0);
+	vla_item_with_sz(d, short, inums, ffs->interfaces_count);
+	vla_item_with_sz(d, char, raw_descs, ffs->raw_descs_length);
+	char *vlabuf;
 
 	ENTER();
 
@@ -2578,24 +2592,28 @@ static int ffs_func_bind(struct usb_configuration *c,
 	if (unlikely(!(full | high | super)))
 		return -ENOTSUPP;
 
-	/* Allocate */
-	data = kmalloc(sizeof *data, GFP_KERNEL);
-	if (unlikely(!data))
+	/* Allocate a single chunk, less management later on */
+	vlabuf = kmalloc(vla_group_size(d), GFP_KERNEL);
+	if (unlikely(!vlabuf))
 		return -ENOMEM;
 
 	/* Zero */
-	memset(data->eps, 0, sizeof data->eps);
-	/* Copy descriptors */
-	memcpy(data->raw_descs, ffs->raw_descs,
-	       ffs->raw_descs_length);
+	memset(vla_ptr(vlabuf, d, eps), 0, d_eps__sz);
+	memcpy(vla_ptr(vlabuf, d, raw_descs), ffs->raw_descs,
+	       d_raw_descs__sz);
+	memset(vla_ptr(vlabuf, d, inums), 0xff, d_inums__sz);
+	for (ret = ffs->eps_count; ret; --ret) {
+		struct ffs_ep *ptr;
 
-	memset(data->inums, 0xff, sizeof data->inums);
-	for (ret = ffs->eps_count; ret; --ret)
-		data->eps[ret].num = -1;
+		ptr = vla_ptr(vlabuf, d, eps);
+		ptr[ret].num = -1;
+	}
 
-	/* Save pointers */
-	func->eps             = data->eps;
-	func->interfaces_nums = data->inums;
+	/* Save pointers
+	 * d_eps == vlabuf, func->eps used to kfree vlabuf later
+	*/
+	func->eps             = vla_ptr(vlabuf, d, eps);
+	func->interfaces_nums = vla_ptr(vlabuf, d, inums);
 
 	/*
 	 * Go through all the endpoint descriptors and allocate
@@ -2603,10 +2621,10 @@ static int ffs_func_bind(struct usb_configuration *c,
 	 * numbers without worrying that it may be described later on.
 	 */
 	if (likely(full)) {
-		func->function.fs_descriptors = data->fs_descs;
+		func->function.fs_descriptors = vla_ptr(vlabuf, d, fs_descs);
 		fs_len = ffs_do_descs(ffs->fs_descs_count,
-				      data->raw_descs,
-				      sizeof data->raw_descs,
+				      vla_ptr(vlabuf, d, raw_descs),
+				      d_raw_descs__sz,
 				      __ffs_func_bind_do_descs, func);
 		if (unlikely(fs_len < 0)) {
 			ret = fs_len;
@@ -2617,10 +2635,10 @@ static int ffs_func_bind(struct usb_configuration *c,
 	}
 
 	if (likely(high)) {
-		func->function.hs_descriptors = data->hs_descs;
+		func->function.hs_descriptors = vla_ptr(vlabuf, d, hs_descs);
 		hs_len = ffs_do_descs(ffs->hs_descs_count,
-				      data->raw_descs + fs_len,
-				      (sizeof data->raw_descs) - fs_len,
+				      vla_ptr(vlabuf, d, raw_descs) + fs_len,
+				      d_raw_descs__sz - fs_len,
 				      __ffs_func_bind_do_descs, func);
 		if (unlikely(hs_len < 0)) {
 			ret = hs_len;
@@ -2631,10 +2649,10 @@ static int ffs_func_bind(struct usb_configuration *c,
 	}
 
 	if (likely(super)) {
-		func->function.ss_descriptors = data->ss_descs;
+		func->function.ss_descriptors = vla_ptr(vlabuf, d, ss_descs);
 		ret = ffs_do_descs(ffs->ss_descs_count,
-				data->raw_descs + fs_len + hs_len,
-				(sizeof data->raw_descs) - fs_len - hs_len,
+				vla_ptr(vlabuf, d, raw_descs) + fs_len + hs_len,
+				d_raw_descs__sz - fs_len - hs_len,
 				__ffs_func_bind_do_descs, func);
 		if (unlikely(ret < 0))
 			goto error;
@@ -2648,7 +2666,7 @@ static int ffs_func_bind(struct usb_configuration *c,
 	ret = ffs_do_descs(ffs->fs_descs_count +
 			   (high ? ffs->hs_descs_count : 0) +
 			   (super ? ffs->ss_descs_count : 0),
-			   data->raw_descs, sizeof data->raw_descs,
+			   vla_ptr(vlabuf, d, raw_descs), d_raw_descs__sz,
 			   __ffs_func_bind_do_nums, func);
 	if (unlikely(ret < 0))
 		goto error;
